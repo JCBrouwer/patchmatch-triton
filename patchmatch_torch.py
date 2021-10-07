@@ -1,226 +1,171 @@
-import sys
-import time
+"""
+Pei Yu, Xiaokang Yang, and Li Chen, "Parallel-Friendly Patch Match Based on Jump Flooding"
+https://www.researchgate.net/publication/278703228_Parallel-Friendly_Patch_Match_Based_on_Jump_Flooding
+
+calculate Nearest Neighbor Field, f: A -> R^2.
+for each patch coordinate in image A, difference between neareast patch in B, f(a) = b - a
+D(v) is distance between patch (x,y) in A and (x,y)+v in B.
+kNNF is multi-valued with k offset values for the k nearest patches
+
+based on Jump Flooding, compute approximation to Voronoi diagram
+for l in [n,n/2,n/4,...]:
+    (x,y) passes information to (x+w,y+h) with w,h in {-l,0,l}
+
+initialization
+    offsets to random, independent, uniform sampled patches from B
+    build max-heap for storing patch distances D of kNN in A
+    build hash-table of kNNs to avoid re-testing patches already in kNN
+
+propagation
+    for l in [n,n/2,n/4,...]
+        f_1(x,y) = argmin{D(f_1(x,y)), D(f_i(x+w,y+h))} for all i,w,h with w,h in {-l,0,l}
+        where f_1(x,y) is worst-matched patch in max-heap (new version sifted down lower to max-heap)
+
+parallelization
+    each thread in kernel computes kNN of one patch in A
+    each kernel launch completes on propagation of length l
+    need to store 2 kNN heaps: former round, current round
+    each thread queries offset in former heap, compares to current heap, and (maybe) sifts down in current
+    copy current -> former after each round
+"""
+from time import time
 
 import numpy as np
 import torch
-import torchvision.transforms as transforms
+import torch.nn.functional as F
 from PIL import Image
-
-SHAPE = (224, 224)
-PSIZE = 3
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from torchvision.transforms.functional import to_tensor
 
 
-def feat_patch_distance(feat1, feat2, feat1_, feat2_, pos, pos_p, psize):
-    """
-    Return a distance
-    """
-    y, x = pos
-    yp, xp = pos_p
-    # print(pos, pos_p)
-    return torch.sum(
-        torch.pow(feat1[y : y + psize, x : x + psize, :] - feat2[yp : yp + psize, xp : xp + psize, :], 2)
-    ) + torch.sum(torch.pow(feat1_[y : y + psize, x : x + psize, :] - feat2_[yp : yp + psize, xp : xp + psize, :], 2))
+@torch.jit.script
+def siftdown(heap: torch.Tensor, startpos: int, pos: int):
+    newitem = heap[pos].clone()
+    while pos > startpos:
+        parentpos = (pos - 1) >> 1
+        parent = heap[parentpos]
+        if parent[0] < newitem[0]:
+            heap[pos] = parent
+            pos = parentpos
+            continue
+        break
+    heap[pos] = newitem
 
 
-def improve_guess(pos, pos_new_f, best_pos_f, best_dist, feat1, feat2, feat1_, feat2_, psize=2):
-    """
-    Return the best b position and corresponding distance
-    Params:
-        pos(2):position for update
-        pos_f(2): new_position in b for update
-        best_pos_f(2): best pos now
-        best_dist(1): best distance now
-        feat*(H*W*C): features
-    """
-    # print(best_dist)
-    new_dist = feat_patch_distance(feat1, feat2, feat1_, feat2_, pos, pos_new_f, psize)
-    if new_dist < best_dist:
-        return pos_new_f, new_dist
-    else:
-        return best_pos_f, best_dist
+@torch.jit.script
+def siftup(heap: torch.Tensor, pos: int):
+    endpos = heap.shape[0]
+    startpos = pos
+    newitem = heap[pos].clone()
+    childpos = 2 * pos + 1
+    while childpos < endpos:
+        rightpos = childpos + 1
+        if rightpos < endpos and not heap[rightpos][0] < heap[childpos][0]:
+            childpos = rightpos
+        heap[pos] = heap[childpos]
+        pos = childpos
+        childpos = 2 * pos + 1
+    heap[pos] = newitem
+    siftdown(heap, startpos, pos)
 
 
-def propagation(pos, change, f, dist_f, feat1, feat2, feat1_, feat2_, eff_shape, psize=2):
-    """
-    Batch Propagation in patch match.
-    Params:
-        pos(torch.Tensor:2): batch of position
-        change(torch.Tensor:2): direction for propagation
-        f(torch.Tensor:H*W*2): a \phi_a->b function represented by a tensor relative position
-        dist_f(torch.Tensor:H*W): a \phi_a->b function represented by a tensor min dist
-        feat*(torch.Tensor:C*H*W): batch features
-    Return best_f(torch.Tensor:H*W*2) best_dist_f(torch.Tensor:H*W)
-    """
-    y, x = pos
-    ew, eh = eff_shape
-    best_pos_f = f[y, x]
-    best_dist = dist_f[y, x]
-
-    # make the change variable
-    ychange, xchange = change
-    # Batch pos adding up_change new 2
-    if abs(x - xchange) < ew and x - xchange >= 0:
-        yp, xp = f[y, x - xchange]
-        xp = xp + xchange
-        if xp < ew and xp >= 0:
-            best_pos_f, best_dist = improve_guess(
-                pos, (yp, xp), best_pos_f, best_dist, feat1, feat2, feat1_, feat2_, psize
-            )
-
-    if abs(y - ychange) < eh and y - ychange >= 0:
-        yp, xp = f[y - ychange, x]
-        yp = yp + ychange
-        if yp < eh and yp >= 0:
-            best_pos_f, best_dist = improve_guess(
-                pos, (yp, xp), best_pos_f, best_dist, feat1, feat2, feat1_, feat2_, psize
-            )
-
-    # f, dist_f = update_f_dist_f(pos, f, dist_f, best_pos_f, best_dist)
-
-    return best_pos_f, best_dist
+@torch.jit.script
+def heapreplace(heap: torch.Tensor, item: torch.Tensor):
+    heap[0] = item
+    siftup(heap, 0)
+    return heap
 
 
-def random_search(pos, f, dist_f, best_pos_f, best_dist, feat1, feat2, feat1_, feat2_, eff_shape, alpha=0.5, psize=2):
-    """
-    Batch Random Search For patch Match
-    """
-    r = [eff_shape[0], eff_shape[1]]
-    eh, ew = eff_shape
-    while r[0] >= 1 and r[1] >= 1:
-        best_y, best_x = best_pos_f
-        # end_time = time.time()
-        xmin, xmax = max(best_x - r[1], 0), min(best_x + r[1] + 1, ew)
-        ymin, ymax = max(best_y - r[0], 0), min(best_y + r[0] + 1, eh)
-        pos_random_f = (torch.tensor([ymin, xmin]) + torch.rand(2) * torch.tensor([ymax - ymin, xmax - xmin])).type(
-            torch.LongTensor
-        )
-        # print("Random Search: Random Pos Time:{}".format(time.time() - end_time))
-        # end_time = time.time()
-        best_pos_f, best_dist = improve_guess(pos, pos_random_f, best_pos_f, best_dist, feat1, feat2, feat1_, feat2_)
-        # print("Random Search: Improve Time:{}".format(time.time() - end_time))
-
-        r = [int(alpha * r[0]), int(alpha * r[1])]
-
-    return best_pos_f, best_dist
+@torch.jit.script
+def heapify(x: torch.Tensor):
+    for i in torch.arange(x.shape[0] // 2, 0, -1):
+        siftup(x, i)
+    return x
 
 
-def initialize_direction(i, ae_shape):
-    if (i) % 2 == 1:
-        change = [-1, -1]
-        start = [ae_shape[0] - 1, ae_shape[1] - 1]
-        end = [-1, -1]
-    else:
-        change = [1, 1]
-        start = [0, 0]
-        end = [ae_shape[0], ae_shape[1]]
-    return change, start, end
+@torch.jit.script
+def distance(a: torch.Tensor, b: torch.Tensor):
+    return torch.sum(torch.square(b - a), dim=[1, 2, 3])
 
 
-def get_effective_shape(img_shape, psize):
-    return (int(img_shape[0] - psize + 1), int(img_shape[1] - psize + 1))
+# @torch.jit.script
+def patch_match(img_A: torch.Tensor, img_B: torch.Tensor, K: int = 7, patch_size: int = 5):
+    (A_h, A_w), (B_h, B_w) = img_A.shape[2:], img_B.shape[2:]
+    r = patch_size // 2
+    patch_range = torch.arange(-r, r + 1)
+    patch_window = torch.stack(torch.meshgrid(patch_range, patch_range, indexing="ij"))[None]
 
+    img_A = F.pad(img_A, (r, r, r, r), mode="reflect")
+    img_B = F.pad(img_B, (r, r, r, r), mode="reflect")
 
-def deep_patch_match(feat1, feat2, feat1_, feat2_, img_shape, psize=2, iteration=5, alpha=0.5):
-    """
-    A deep patch match method based on two pairs data. Formulated in Deep Image Analogy
-    Original version only use img1 and img2
-    Params: img1(torch.Tensor):  shape C*H*W
-    """
-    assert feat1.size() == feat2.size() == feat1_.size() == feat2_.size()
-    eff_shape = get_effective_shape(img_shape, psize)
-    # eff_shape = get_effective_shape(img_shape, psize)
-    feat1, feat2, feat1_, feat2_ = feat1.to(device), feat2.to(device), feat1_.to(device), feat2_.to(device)
-    # initialization
-    f = torch.zeros(*((img_shape) + (2,)), device=device, dtype=torch.int32)
-    dist_f = torch.zeros(*img_shape, device=device)
-    for y in range(eff_shape[0]):
-        for x in range(eff_shape[1]):
-            pos = (y, x)
-            pos_f = (np.random.randint(eff_shape[0]), np.random.randint(eff_shape[1]))
-            f[y, x] = torch.tensor(pos_f, device=device).type(torch.LongTensor)
-            dist_f[y, x] = feat_patch_distance(feat1, feat2, feat1_, feat2_, pos, pos_f, psize)
+    # initialize
+    idxsB = torch.randint(B_h * B_w, size=(A_h, A_w, K))
+    ysB = torch.div(idxsB, B_w, rounding_mode="floor") + r
+    xsB = idxsB % B_w + r
+    patch_ysB = (ysB[..., None, None] + patch_window[None, :, 0]).long()
+    patch_xsB = (xsB[..., None, None] + patch_window[None, :, 1]).long()
+    patchesB = img_B.squeeze()[:, patch_ysB, patch_xsB].permute(1, 2, 3, 4, 5, 0).reshape(A_h, A_w, K, -1)
 
-    for i in range(iteration):
-        print("Iteration {}: Running".format(i + 1))
-        change, start, end = initialize_direction(i, eff_shape)
-        print("start:{}, end:{}, change:{}".format(start, end, change))
-        ori_time = end_time = time.time()
-        for y in range(int(start[0]), int(end[0]), int(change[0])):
-            for x in range(int(start[1]), int(end[1]), int(change[1])):
-                pos = (y, x)
-                best_pos_f, best_dist = propagation(
-                    pos, change, f, dist_f, feat1, feat2, feat1_, feat2_, eff_shape, psize
+    idxsA = torch.stack(torch.meshgrid(torch.arange(A_h), torch.arange(A_w), indexing="ij"))
+    patchesA = idxsA[..., None, None] + patch_window[0, :, None, None]
+    patchesA = img_A.squeeze()[:, patchesA[0], patchesA[1]].permute(1, 2, 3, 4, 0)
+    patchesA = torch.tile(patchesA[:, :, None], [1, 1, K, 1, 1, 1]).reshape(A_h, A_w, K, -1)
+
+    dAB = torch.sum(torch.square(patchesB - patchesA), dim=-1)
+    kNNF = torch.stack((dAB, ysB, xsB), dim=-1)
+    for y in torch.arange(A_h):
+        for x in torch.arange(A_w):
+            kNNF[y, x] = heapify(kNNF[y, x])
+
+    # propagate
+    max_side = torch.maximum(torch.tensor(A_h), torch.tensor(A_w))
+    ls = torch.floor(max_side / torch.pow(2, torch.arange(torch.log2(max_side))))
+    for l in ls:
+
+        offsets = torch.stack([-l, torch.zeros([1]).squeeze(), l]).long()
+        hs, ws = torch.meshgrid(offsets, offsets, indexing="ij")
+        hs, ws = hs.flatten(), ws.flatten()
+
+        for y in torch.arange(A_h):
+            for x in torch.arange(A_w):
+
+                ys, xs = (y + hs).clamp(0, A_h - 1).long(), (x + ws).clamp(0, A_w - 1).long()
+                candidates = kNNF[ys, xs][:, :, [1, 2]].clone().reshape(hs.shape[0] * K, 2, 1, 1).long()
+                idxs = candidates + patch_window
+
+                # TODO how to use hashmap?
+
+                dists = distance(
+                    torch.tile(img_A[:, :, y : y + patch_size, x : x + patch_size], (idxs.shape[0], 1, 1, 1)),
+                    img_B.squeeze()[:, idxs[:, 0], idxs[:, 1]].permute(1, 0, 2, 3),
                 )
-                best_pos_f, best_dist = random_search(
-                    pos, f, dist_f, best_pos_f, best_dist, feat1, feat2, feat1_, feat2_, eff_shape, psize=psize
-                )
-                f[y, x] = torch.tensor(best_pos_f, device=device, dtype=torch.int32)
-                dist_f[y, x] = best_dist
+                best = torch.argmin(dists)
+                best_candidate = candidates.squeeze()[best]
 
-        re_img1 = reconstruct_avg(feat2, f, psize=PSIZE)
-        save_img(re_img1, "epoch_{}_re_test.png".format(i))
-        print("Iteration {}: Finishing Time : {}".format(i + 1, time.time() - ori_time))
-    return f
+                kNNF[y, x] = heapreplace(kNNF[y, x], torch.stack([dists[best], best_candidate[0], best_candidate[1]]))
 
-
-def reconstruct_avg(feat2, f, psize=2):
-    """
-    Reconstruct another batch feat1 from batch feat2 by f
-    Params:
-        feat2(torch.Tensor:shape (C*H*W)): feature 2
-        f(torch.Tensor:shape (H*W*2)): f : 1->2
-    """
-    # assert feat.size()[2:] == f.size(H)
-    print(feat2.size())
-    feat1 = torch.zeros_like(feat2)
-
-    for y in range(feat2.size(0)):
-        for x in range(feat2.size(1)):
-            yp, xp = f[y, x]
-            # print(yp,xp)
-            batch_feat = feat2[yp : yp + psize, xp : xp + psize, :]
-            feat1[y, x, :] = feat2[
-                yp, xp, :
-            ]  # batch_feat.reshape(psize*psize, feat2.size(2)).transpose(0,1).mean(dim=1)
-
-    return feat1[: feat1.size(0) - psize, : feat1.size(1) - psize, :]
-
-
-def img_padding(img, psize):
-    """
-    Input C*H*W
-    """
-    img = np.array(img)
-    h, w, c = img.shape
-    new_img = torch.zeros(h + psize, w + psize, c)
-    new_img[:h, :w, :] = torch.tensor(img)
-    return new_img / 255
-
-
-def save_img(img, name):
-    # print(img)
-    img = img.cpu().numpy() * 255
-    # print(img.shape)
-    # print(value, sep=' ', end='n', file=sys.stdout, flush=False)
-    img = Image.fromarray(img.astype(np.uint8))
-    img.save(name)
-
-
-def main():
-    transforms_fun = transforms.Compose([transforms.Resize(SHAPE)])
-    img1 = transforms_fun(Image.open(sys.argv[1]))
-    img2 = transforms_fun(Image.open(sys.argv[2]))
-    # img1, img2 = reshape_test(img1),reshape_test(img2)
-    img1 = img_padding(img1, PSIZE)
-    img2 = img_padding(img2, PSIZE)
-    f = deep_patch_match(img1, img2, img1, img2, SHAPE, psize=PSIZE, iteration=5, alpha=0.5)
-
-    re_img1 = reconstruct_avg(img2, f, psize=PSIZE)
-
-    save_img(re_img1[0], sys.argv[3])
+    return kNNF
 
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        main()
+        img_A = Image.open("bike_a.png")
+        img_B = Image.open("bike_b.png").resize((img_A.size[1] + 25, img_A.size[0] - 12))
+
+        img_A = to_tensor(img_A).unsqueeze(0)
+        img_B = to_tensor(img_B).unsqueeze(0)
+
+        P = 3
+        K = 5
+
+        t = time()
+        kNNF = patch_match(img_A, img_B, K=K, patch_size=P)
+        print(time() - t)
+
+        result = torch.zeros((img_A.shape[2], img_A.shape[3], img_A.shape[1]))
+        all_dists = torch.zeros((img_A.shape[2], img_A.shape[3]))
+        for y in range(img_A.shape[2]):
+            for x in range(img_A.shape[3]):
+                all_dists[y, x] = kNNF[y, x, 0, 0]
+                result[y, x] = img_B[:, :, kNNF[y, x, 0, 1].long() - P // 2, kNNF[y, x, 0, 2].long() - P // 2].squeeze()
+        result = (result.cpu().numpy() * 255).astype(np.uint8)
+        Image.fromarray(result).save(f"results/bike_{torch.mean(all_dists):.5f}.jpg")
