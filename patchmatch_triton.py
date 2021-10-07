@@ -91,7 +91,21 @@ def distance(a: torch.Tensor, b: torch.Tensor):
 # fmt: off
 @triton.jit
 def propagate_kernel(A_ptr, B_ptr, kNNF_ptr, output_ptr, l: int, K: int, P: int, A_h: int, A_w: int, A_c: int, **meta):
-    B = meta["BLOCK_SIZE"]
+    """
+    Args:
+        A_ptr : pointer to image A which has shape (A_w, A_h, A_c)
+        B_ptr : pointer to image B
+        kNNF_ptr : pointer to k nearest neighbor field which is (A_w , A_h, K, 3)
+        output_ptr : pointer to output kNNF values for this iteration which is (A_w, A_h, K)
+        l (int): looking distance (where to look for candidates)
+        K (int): number of nearest neighbors (default: 5)
+        P (int): patch size (default: 3)
+        A_h (int): height of image A
+        A_w (int): width of image A
+        A_c (int): number of channels in image A
+    """
+    
+    B = meta["BLOCK_SIZE"] # 16
 
     # map pid to block of kNNF that it should compute
     pid = tl.program_id(axis=0)
@@ -101,10 +115,11 @@ def propagate_kernel(A_ptr, B_ptr, kNNF_ptr, output_ptr, l: int, K: int, P: int,
     x = pid // num_pid_w
     ys = y * B + tl.arange(0, B)
     xs = x * B + tl.arange(0, B)
-    A_grid = ys[:, None] + xs[None, :]  # TODO need stride in ptr sum?
+    A_grid = ys[:, None] + xs[None, :]  # TODO need to add stride in ptr sum?
 
+    # arrays for indexing certain things
     window = tl.arange(0, 3) - P // 2  # tl.arange(-P // 2, P // 2 + 1)
-    channels = tl.arange(0, 3)  # A_c
+    channels = tl.arange(0, 3)  # A_c 
     coord_dim = tl.arange(1, 3) 
     dist_dim = tl.zeros((1,), dtype=tl.int32)
     neighbors = tl.arange(0, 5)  # K
@@ -119,14 +134,13 @@ def propagate_kernel(A_ptr, B_ptr, kNNF_ptr, output_ptr, l: int, K: int, P: int,
     )  #                    B     B     1     P     P     A_c
     A_patches = tl.load(A_patch_idxs)
 
-    # retrieve candidate patches from B and find minimal
+    # look for new candidate patches l pixels left, right, up, and down (9 locations)
     candidates = tl.zeros((9, B, B, 2), dtype=tl.int32)
-
     candidate_distances = tl.zeros((9, B, B), dtype=tl.float32)
-
     i = 0
     for h in range(-l, l, l):
         for w in range(-l, l, l):
+
             # ensure indexes stay in bounds
             candidate_ys = tl.maximum(0, tl.minimum(A_h - 1, ys + h))
             candidate_xs = tl.maximum(0, tl.minimum(A_w - 1, xs + w))
@@ -139,7 +153,10 @@ def propagate_kernel(A_ptr, B_ptr, kNNF_ptr, output_ptr, l: int, K: int, P: int,
                 + neighbors   [None, None,    :, None]
                 + coord_dim   [None, None, None,    :]
             )  #               B     B     K     2
-            candidate_idxs = candidate_coords[:, :, :, 0] + candidate_coords[:, :, :, 1]  # TODO need stride in ptr sum?
+
+            # candidate_coords shape here is actually (B, B, K, 3) !?
+            # candidate_idxs = tl.sum(candidate_coords, axis=3)  # Error: Encountered unimplemented code path in sum. This is likely a bug on our side.
+            candidate_idxs = candidate_coords[:, :, :, 0] + candidate_coords[:, :, :, 1]  # Error: cannot reshape block of different shape
             B_patch_center_idxs = tl.load(candidate_idxs)
 
             # load corresponding patches from image B
@@ -164,8 +181,8 @@ def propagate_kernel(A_ptr, B_ptr, kNNF_ptr, output_ptr, l: int, K: int, P: int,
 
     # find overal best candidates
     idxs_new = triton.torch.argmin(candidate_distances, axis=0)  # B, B
-    kNNF_coord_new = B_patch_center_idxs[idxs_new]  # B, B, 2
-    kNNF_dist_new = distances[idxs_new]  # B, B, 1
+    kNNF_coord_new = candidates[idxs_new[None, :, :, None]]  # B, B, 2
+    kNNF_dist_new = candidate_distances[idxs_new[None, :, :]]  # B, B
 
     # store 
     tl.store(output_ptr + A_grid[:, :, None] + dist_dim[None, None, :], kNNF_dist_new)
@@ -182,7 +199,17 @@ def propagate(A: torch.Tensor, B: torch.Tensor, kNNF: torch.Tensor, l: int, K: i
     grid = lambda meta: (triton.cdiv(A_h, meta["BLOCK_SIZE"]) * triton.cdiv(A_w, meta["BLOCK_SIZE"]),)
 
     pgm = propagate_kernel[grid](
-        A, B, kNNF, output, int(l), int(K), int(P), int(A_h), int(A_w), int(A_c), BLOCK_SIZE=16
+        A.squeeze().permute(1, 2, 0),
+        B.squeeze().permute(1, 2, 0),
+        kNNF,
+        output,
+        int(l),
+        int(K),
+        int(P),
+        int(A_h),
+        int(A_w),
+        int(A_c),
+        BLOCK_SIZE=16,
     )
 
     return output
@@ -234,8 +261,8 @@ def patch_match(img_A: torch.Tensor, img_B: torch.Tensor, K: int = 7, P: int = 5
 
 if __name__ == "__main__":
     with torch.inference_mode():
-        img_A = Image.open("bike_a.png").resize((256, 192))
-        img_B = Image.open("bike_b.png").resize((240, 176))
+        img_A = Image.open("bike_a.png").resize((240, 176))
+        img_B = Image.open("bike_b.png").resize((256, 192))
 
         img_A = to_tensor(img_A).unsqueeze(0).to(GPU)
         img_B = to_tensor(img_B).unsqueeze(0).to(GPU)
