@@ -3,3 +3,5 @@ PatchMatch-Pytorch/
 *.jpg
 *.png
 *.mp4
+!bike_a.png
+!bike_b.png
