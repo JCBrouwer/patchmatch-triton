@@ -87,7 +87,7 @@ def distance(a: torch.Tensor, b: torch.Tensor):
     return torch.sum(torch.square(b - a), dim=[1, 2, 3])
 
 
-# @torch.jit.script
+# @torch.jit.script  # faster without script?!
 def patch_match(img_A: torch.Tensor, img_B: torch.Tensor, K: int = 7, patch_size: int = 5):
     (A_h, A_w), (B_h, B_w) = img_A.shape[2:], img_B.shape[2:]
     r = patch_size // 2
