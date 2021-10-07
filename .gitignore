@@ -1,0 +1,5 @@
+.vscode/
+PatchMatch-Pytorch/
+*.jpg
+*.png
+*.mp4
